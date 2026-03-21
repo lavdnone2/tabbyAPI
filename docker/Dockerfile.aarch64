@@ -1,0 +1,74 @@
+# Use NVIDIA's Jetson Thor image — has PyTorch + CUDA 13 with working cuBLAS for sm_110
+FROM ghcr.io/nvidia-ai-iot/vllm:latest-jetson-thor
+
+# Install system dependencies for building from source
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    git \
+    ninja-build \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip + build tools
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel packaging
+
+# Set the working directory in the container
+WORKDIR /app
+
+# ── 1. Ensure build deps are present (may already be in base image) ──
+RUN pip show psutil >/dev/null 2>&1 || pip install --no-cache-dir psutil
+RUN pip show numpy >/dev/null 2>&1 || pip install --no-cache-dir numpy
+
+# ── 2. Tell PyTorch which GPU arch to compile CUDA kernels for (no GPU at build time) ──
+ENV TORCH_CUDA_ARCH_LIST="11.0+PTX"
+ENV MAX_JOBS=4
+
+# ── 3. Build flash-attn from source if not already present ──
+RUN pip show flash-attn >/dev/null 2>&1 || pip install --no-cache-dir --no-build-isolation flash-attn
+
+# ── 4. Install Rust toolchain + maturin (exllamav3 is a Rust+Python project) ──
+RUN apt-get update && apt-get install -y --no-install-recommends cargo rustc && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir maturin
+
+# ── 5. Build exllamav3 from source (pinned to match pyproject.toml) ──
+#    Clone, patch x86-only code for aarch64, then install
+RUN git clone --depth 1 --branch v0.0.26 https://github.com/turboderp-org/exllamav3.git /tmp/exllamav3
+
+# Fully stub avx2_target.cpp — the original uses x86-only intrinsics and builtins
+RUN cat > /tmp/exllamav3/exllamav3/exllamav3_ext/avx2_target.cpp << 'STUB'
+// Stubbed for aarch64 — no AVX2, no x86 FP control
+bool is_avx2_supported() { return false; }
+void enable_fast_fp() { }
+STUB
+
+# Fully stub all_reduce_cpu_avx2.cpp — uses x86 immintrin.h / AVX2 intrinsics
+RUN cat > /tmp/exllamav3/exllamav3/exllamav3_ext/parallel/all_reduce_cpu_avx2.cpp << 'STUB'
+// Stubbed for aarch64 — AVX2 not available
+#include <cstdint>
+struct PGContext;
+void perform_cpu_reduce(PGContext* ctx, unsigned long a, unsigned int b, unsigned char* c, unsigned long d) { }
+STUB
+
+RUN pip install --no-cache-dir --no-build-isolation /tmp/exllamav3 && rm -rf /tmp/exllamav3
+
+# ── 6. Install base deps from pyproject.toml (skip cu12 and extras groups) ──
+COPY pyproject.toml .
+RUN pip install --no-cache-dir "."
+RUN rm pyproject.toml
+
+# Copy the project
+COPY . .
+
+# ── 7. Patch the invalid escape sequence in logger.py ──
+RUN sed -i 's/replace("<", "\\\\<")/replace("<", r"\\<")/' /app/common/logger.py 2>/dev/null || true
+
+# Make port 5000 available to the world outside this container
+EXPOSE 5000
+
+# Set the entry point
+ENTRYPOINT ["python3"]
+
+# Run main.py when the container launches
+CMD ["main.py"]
