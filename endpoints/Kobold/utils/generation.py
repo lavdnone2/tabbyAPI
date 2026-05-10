@@ -60,6 +60,8 @@ async def _stream_collector(data: GenerateRequest, request: Request):
         )
 
         async for generation in generator:
+            if generation is None:
+                continue
             if disconnect_task.done():
                 raise CancelledError()
 
@@ -77,9 +79,7 @@ async def _stream_collector(data: GenerateRequest, request: Request):
         # If the request disconnects, break out
         if not abort_event.is_set():
             abort_event.set()
-            handle_request_disconnect(
-                f"Kobold generation {data.genkey} cancelled by user."
-            )
+            handle_request_disconnect(f"Kobold generation {data.genkey} cancelled by user.")
     finally:
         # Cleanup the cache
         del generation_cache[data.genkey]
@@ -95,9 +95,7 @@ async def stream_generation(data: GenerateRequest, request: Request):
     try:
         async for chunk in _stream_collector(data, request):
             response = _create_stream_chunk(chunk)
-            yield ServerSentEvent(
-                event="message", data=response.model_dump_json(), sep="\n"
-            )
+            yield ServerSentEvent(event="message", data=response.model_dump_json(), sep="\n")
     except Exception:
         yield get_generator_error(
             f"Kobold generation {data.genkey} aborted. Please check the server console."

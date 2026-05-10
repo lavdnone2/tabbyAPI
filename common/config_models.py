@@ -29,9 +29,7 @@ class ConfigOverrideConfig(BaseConfigModel):
     """Model for overriding a provided config file."""
 
     # TODO: convert this to a pathlib.path?
-    config: Optional[str] = Field(
-        None, description="Path to an overriding config.yml file"
-    )
+    config: Optional[str] = Field(None, description="Path to an overriding config.yml file")
 
     _metadata: Metadata = PrivateAttr(Metadata(include_in_config=False))
 
@@ -46,9 +44,7 @@ class NetworkConfig(BaseConfigModel):
             "Use 0.0.0.0 to expose on all network adapters."
         ),
     )
-    port: Optional[int] = Field(
-        5000, description="The port to host on (default: 5000)."
-    )
+    port: Optional[int] = Field(5000, description="The port to host on (default: 5000).")
     disable_auth: Optional[bool] = Field(
         False,
         description=(
@@ -60,8 +56,7 @@ class NetworkConfig(BaseConfigModel):
     disable_fetch_requests: Optional[bool] = Field(
         False,
         description=(
-            "Disable fetching external content in response to requests,"
-            "such as images from URLs."
+            "Disable fetching external content in response to requests,such as images from URLs."
         ),
     )
     send_tracebacks: Optional[bool] = Field(
@@ -74,8 +69,7 @@ class NetworkConfig(BaseConfigModel):
     api_servers: Optional[List[Literal["oai", "kobold"]]] = Field(
         ["OAI"],
         description=(
-            'Select API servers to enable (default: ["OAI"]).\n'
-            "Possible values: OAI, Kobold."
+            'Select API servers to enable (default: ["OAI"]).\nPossible values: OAI, Kobold.'
         ),
     )
 
@@ -102,8 +96,7 @@ class LoggingConfig(BaseConfigModel):
     log_requests: Optional[bool] = Field(
         False,
         description=(
-            "Enable request logging (default: False).\n"
-            "NOTE: Only use this for debugging!"
+            "Enable request logging (default: False).\nNOTE: Only use this for debugging!"
         ),
     )
 
@@ -175,8 +168,7 @@ class ModelConfig(BaseConfigModel):
     max_seq_len: Optional[int] = Field(
         None,
         description=(
-            "Max sequence length (default: 4096).\n"
-            "Set to -1 to fetch from the model's config.json"
+            "Max sequence length (default: 4096).\nSet to -1 to fetch from the model's config.json"
         ),
         ge=-1,
     )
@@ -296,8 +288,15 @@ class ModelConfig(BaseConfigModel):
     )
     vision: Optional[bool] = Field(
         False,
+        description=("Enables vision support if the model supports it. (default: False)"),
+    )
+    force_enable_thinking: bool = Field(
+        False,
         description=(
-            "Enables vision support if the model supports it. (default: False)"
+            "Force-enable reasoning in template args\n"
+            "Injects the enable_thinking: True into the model's template arguments. This doesn't\n"
+            "force reasoning or affect how reasoning content is parsed, but some clients will\n"
+            "not explicitly enable this and some models need it to properly enter reasoning mode."
         ),
     )
     reasoning: bool = Field(
@@ -314,6 +313,20 @@ class ModelConfig(BaseConfigModel):
     reasoning_end_token: str = Field(
         "</think>",
         description="End token for the reasoning parser (default: </think>).",
+    )
+    reasoning_suppress_header: str = Field(
+        None,
+        description=(
+            "Suppress this text whenever it appears in the beginning of a reasoning block "
+            "(default: None)."
+        ),
+    )
+    tool_format: Optional[str] = Field(
+        None,
+        description=(
+            "Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank, \n"
+            "tool calls from the model will not be parsed by the server."
+        ),
     )
 
     _metadata: Metadata = PrivateAttr(Metadata())
@@ -334,8 +347,7 @@ class DraftModelConfig(BaseConfigModel):
     draft_model_name: Optional[str] = Field(
         None,
         description=(
-            "An initial draft model to load.\n"
-            "Ensure the model is in the model directory."
+            "An initial draft model to load.\nEnsure the model is in the model directory."
         ),
     )
     draft_rope_scale: Optional[float] = Field(
@@ -441,6 +453,24 @@ class EmbeddingsConfig(BaseConfigModel):
     )
 
 
+class MemoryConfig(BaseConfigModel):
+    """Options for development and experimentation"""
+
+    sysmem_recurrent_cache: Optional[int] = Field(
+        4096,
+        description=("Max size of recurrent cache in system memory, in MB (default: 4096)"),
+    )
+    cuda_malloc_async: Optional[bool] = Field(
+        True,
+        description=(
+            "Use cudaMallocAsync backend in Torch (default: True).\n"
+            "Enabling this is generally preferable, but it may cause issues with certain\n"
+            "workloads. Try disabling it if you experience intermittent OoM errors. If\n"
+            "False, Torch will use the allocator defined by the system env"
+        ),
+    )
+
+
 class DeveloperConfig(BaseConfigModel):
     """Options for development and experimentation"""
 
@@ -462,6 +492,18 @@ class DeveloperConfig(BaseConfigModel):
             "For realtime process priority, run as administrator or sudo.\n"
             "Otherwise, the priority will be set to high."
         ),
+    )
+    seqlog: Optional[bool] = Field(
+        False,
+        description=("Enable extremely verbose seqlog logging, requires a running Seq server"),
+    )
+    seqlog_server_url: Optional[str] = Field(
+        "http://localhost:5341",
+        description=("Seq server url:port"),
+    )
+    seqlog_api_key: Optional[str] = Field(
+        None,
+        description=("Seq server API key (default: None)"),
     )
 
 
@@ -491,6 +533,9 @@ class TabbyConfigModel(BaseModel):
     )
     sampling: Optional[SamplingConfig] = Field(
         default_factory=SamplingConfig.model_construct,
+    )
+    memory: Optional[MemoryConfig] = Field(
+        default_factory=MemoryConfig.model_construct,
     )
     developer: Optional[DeveloperConfig] = Field(
         default_factory=DeveloperConfig.model_construct,

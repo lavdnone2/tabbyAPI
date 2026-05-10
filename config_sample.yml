@@ -156,15 +156,28 @@ model:
   # Enables vision support if the model supports it. (default: False)
   vision: false
 
+  # Force-enable reasoning in template args
+  # Injects the enable_thinking: True into the model's template arguments. This doesn't
+  # force reasoning or affect how reasoning content is parsed, but some clients will
+  # not explicitly enable this and some models need it to properly enter reasoning mode.
+  force_enable_thinking: false
+
   # Enable reasoning parser (default: False).
   # Do NOT enable this if the model is not a reasoning model (e.g. deepseek-r1 series)
   reasoning: false
 
-  # The start token for reasoning conetnt (default: "<think>")
+  # The start token for reasoning content (default: "<think>")
   reasoning_start_token: "<think>"
 
-  # The end token for reasoning conetnt (default: "</think>")
+  # The end token for reasoning content (default: "</think>")
   reasoning_end_token: "</think>"
+
+  # Suppress this text whenever it appears in the beginning of a reasoning block (default: None)
+  reasoning_suppress_header:
+
+  # Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank,
+  # tool calls from the model will not be parsed by the server.
+  tool_format:
 
 # Options for draft models (speculative decoding)
 # This will use more VRAM!
@@ -231,6 +244,18 @@ embeddings:
   # An initial embedding model to load on the infinity backend.
   embedding_model_name:
 
+# Global memory settings
+memory:
+
+  # Max size of recurrent cache in system memory, in MB (default: 4096)
+  sysmem_recurrent_cache: 4096
+
+  # Use cudaMallocAsync backend in Torch (default: True).
+  # Enabling this is generally preferable, but it may cause issues with certain
+  # workloads. Try disabling it if you experience intermittent OoM errors. If
+  # False, Torch will use the allocator defined by the system env
+  cuda_malloc_async: True
+
 # Options for development and experimentation
 developer:
   # Skip Exllamav2 version check (default: False).
@@ -244,3 +269,12 @@ developer:
   # For realtime process priority, run as administrator or sudo.
   # Otherwise, the priority will be set to high.
   realtime_process_priority: false
+
+  # Enable extremely verbose seqlog logging, requires a running Seq server
+  seqlog: false
+
+  # Seq server url:port
+  seqlog_server_url: http://localhost:5341
+
+  # Seq server API key (default: None)
+  seqlog_api_key:

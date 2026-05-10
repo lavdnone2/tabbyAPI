@@ -4,13 +4,20 @@ from typing import Literal, Union, List, Optional, Dict
 from uuid import uuid4
 
 from endpoints.OAI.types.common import UsageStats, CommonCompletionRequest
-from endpoints.OAI.types.tools import ToolSpec, ToolCall
+from endpoints.OAI.types.tools import NamedToolChoice, ToolSpec, ToolCall
+
+
+class ChatCompletionLogprobLeaf(BaseModel):
+    token: str
+    token_id: Optional[int] = None  # not standard but widely adopted
+    logprob: float
 
 
 class ChatCompletionLogprob(BaseModel):
     token: str
+    token_id: Optional[int] = None  # not standard but widely adopted
     logprob: float
-    top_logprobs: Optional[List["ChatCompletionLogprob"]] = Field(default_factory=list)
+    top_logprobs: Optional[List[ChatCompletionLogprobLeaf]] = Field(default_factory=list)
 
 
 class ChatCompletionLogprobs(BaseModel):
@@ -40,7 +47,7 @@ class ChatCompletionRespChoice(BaseModel):
     index: int = 0
     finish_reason: Optional[str] = None
 
-    # let's us understand why it stopped and if we need to generate a tool_call
+    # Lets us understand why it stopped and if we need to generate a tool_call
     stop_str: Optional[str] = None
     message: ChatCompletionMessage
     logprobs: Optional[ChatCompletionLogprobs] = None
@@ -72,10 +79,15 @@ class ChatCompletionRequest(CommonCompletionRequest):
 
     tools: Optional[List[ToolSpec]] = None
     functions: Optional[List[Dict]] = None
+    tool_choice: Optional[Union[Literal["none", "auto", "required"], NamedToolChoice]] = None
+    parallel_tool_calls: Optional[bool] = True
 
     # Chat completions requests do not have a BOS token preference. Backend
     # respects the tokenization config for the individual model.
     add_bos_token: Optional[bool] = None
+
+    # Accept json_schema as top-level argument
+    json_schema: Optional[object] = None
 
     @field_validator("add_bos_token", mode="after")
     def force_bos_token(cls, v):

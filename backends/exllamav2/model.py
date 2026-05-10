@@ -24,7 +24,6 @@ from exllamav2.generator import (
     ExLlamaV2DynamicJobAsync,
 )
 from itertools import zip_longest
-from loguru import logger
 from typing import Dict, List, Optional
 
 from backends.base_model_container import BaseModelContainer
@@ -41,15 +40,18 @@ from common.gen_logging import (
     log_prompt,
     log_response,
 )
+from common.logger import xlogger
 from common.hardware import hardware_supports_flash_attn
 from common.health import HealthManager
 from common.multimodal import MultimodalEmbeddingWrapper
+from common.networking import DisconnectHandler
 from common.optional_dependencies import check_package_version
 from common.sampling import BaseSamplerRequest
 from common.templating import PromptTemplate, find_prompt_template
 from common.transformers_utils import HFModel
 from common.utils import calculate_rope_alpha, coalesce, unwrap
 from endpoints.core.types.model import ModelCard, ModelCardParameters
+from endpoints.OAI.utils.tools import is_supported_format
 
 
 class ExllamaV2Container(BaseModelContainer):
@@ -109,6 +111,19 @@ class ExllamaV2Container(BaseModelContainer):
         Kwargs are located in config_sample.yml
         """
 
+        _hf = hf_model.hf_config
+        _tok = hf_model.tokenizer_config
+        _gen = hf_model.generation_config
+        xlogger.debug(
+            "Creating ExLlamaV2 model instance",
+            {
+                "kwargs": kwargs,
+                "hf_config": _hf.model_dump(mode="json") if _hf else {},
+                "tokenizer_config": _tok.model_dump(mode="json") if _tok else {},
+                "generation_config": _gen.model_dump(mode="json") if _gen else {},
+            },
+        )
+
         # Create a new instance as a "fake self"
         self = cls()
 
@@ -133,11 +148,11 @@ class ExllamaV2Container(BaseModelContainer):
         # Set vision state and error if vision isn't supported on the current model
         self.use_vision = unwrap(kwargs.get("vision"), False)
         if self.use_vision and not self.config.vision_model_type:
-            raise ValueError(
+            xlogger.warning(
                 "The provided model does not have vision capabilities that are "
-                "supported by ExllamaV2. "
-                "Please reload with vision disabled."
+                "supported by ExllamaV2. Vision input is disabled."
             )
+            self.use_vision = False
 
         # Prepare the draft model config if necessary
         draft_args = unwrap(kwargs.get("draft_model"), {})
@@ -146,7 +161,7 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Always disable draft if params are incorrectly configured
         if draft_args and draft_model_name is None:
-            logger.warning(
+            xlogger.warning(
                 "Draft model is disabled because a model name "
                 "wasn't provided. Please check your config.yml!"
             )
@@ -154,9 +169,7 @@ class ExllamaV2Container(BaseModelContainer):
 
         if self.use_draft_model:
             self.draft_config = ExLlamaV2Config()
-            draft_model_path = pathlib.Path(
-                unwrap(draft_args.get("draft_model_dir"), "models")
-            )
+            draft_model_path = pathlib.Path(unwrap(draft_args.get("draft_model_dir"), "models"))
             draft_model_path = draft_model_path / draft_model_name
 
             self.draft_gpu_split = unwrap(draft_args.get("draft_gpu_split"), [])
@@ -171,7 +184,7 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Catch exllamav3 cache_mode
         if self.cache_mode != "FP16" and not self.cache_mode.startswith("Q"):
-            logger.warning(
+            xlogger.warning(
                 f"Provided cache mode '{self.cache_mode}' is not a "
                 "valid choice for exllamav2, please check your settings. "
                 "Defaulting to FP16."
@@ -188,7 +201,7 @@ class ExllamaV2Container(BaseModelContainer):
         # Set GPU split options
         if gpu_count == 1:
             self.gpu_split_auto = False
-            logger.info("Disabling GPU split because one GPU is in use.")
+            xlogger.info("Disabling GPU split because one GPU is in use.")
         else:
             # Set tensor parallel
             if use_tp:
@@ -203,22 +216,17 @@ class ExllamaV2Container(BaseModelContainer):
                 self.gpu_split = gpu_split
 
                 gpu_device_list = [
-                    device_idx
-                    for device_idx, memory in enumerate(self.gpu_split)
-                    if memory > 0
+                    device_idx for device_idx, memory in enumerate(self.gpu_split) if memory > 0
                 ]
             elif gpu_split_auto and not self.use_tp:
                 # Otherwise fallback to autosplit settings
                 self.gpu_split_auto = gpu_split_auto
 
-                autosplit_reserve_megabytes = unwrap(
-                    kwargs.get("autosplit_reserve"), [96]
-                )
+                autosplit_reserve_megabytes = unwrap(kwargs.get("autosplit_reserve"), [96])
 
                 # Reserve VRAM for each GPU
                 self.autosplit_reserve = [
-                    int(math.ceil(value * 1024**2))
-                    for value in autosplit_reserve_megabytes
+                    int(math.ceil(value * 1024**2)) for value in autosplit_reserve_megabytes
                 ]
 
             # Change the GPU device list only if gpu_split's list is too small
@@ -250,7 +258,7 @@ class ExllamaV2Container(BaseModelContainer):
                 "(30 series) or newer. AMD GPUs are not supported."
             )
 
-            logger.warning(gpu_unsupported_message)
+            xlogger.warning(gpu_unsupported_message)
 
             self.config.no_flash_attn = True
             if self.draft_config:
@@ -276,9 +284,7 @@ class ExllamaV2Container(BaseModelContainer):
             self.cache_size = self.config.max_seq_len
 
         # Set the rope scale
-        self.config.scale_pos_emb = unwrap(
-            kwargs.get("rope_scale"), self.config.scale_pos_emb
-        )
+        self.config.scale_pos_emb = unwrap(kwargs.get("rope_scale"), self.config.scale_pos_emb)
 
         # Sets rope alpha value.
         # Utilize the model's max_position_embeddings as a base value
@@ -296,13 +302,22 @@ class ExllamaV2Container(BaseModelContainer):
             kwargs.get("prompt_template"), model_directory
         )
 
+        # Tool calling
+        self.tool_format = kwargs.get("tool_format")
+        if self.tool_format and not is_supported_format(self.tool_format):
+            xlogger.warning(f"Unrecognized tool_format in config: {self.tool_format}")
+            self.tool_format = None
+        if self.tool_format:
+            xlogger.info(f"Using tool format: {self.tool_format}")
+
         # Catch all for template lookup errors
         if self.prompt_template:
-            logger.info(
-                f'Using template "{self.prompt_template.name}" for chat completions.'
+            xlogger.info(
+                f'Using template "{self.prompt_template.name}" for chat completions.',
+                {"raw": self.prompt_template.raw_template},
             )
         else:
-            logger.warning(
+            xlogger.warning(
                 "Chat completions are disabled because a prompt "
                 "template wasn't provided or auto-detected."
             )
@@ -314,7 +329,7 @@ class ExllamaV2Container(BaseModelContainer):
         if chunk_remainder != 0:
             rounded_chunk_size = int(256 * ((chunk_size - chunk_remainder) / 256 + 1))
 
-            logger.warning(
+            xlogger.warning(
                 f"The given chunk size ({chunk_size}) is "
                 "not a multiple of 256.\n"
                 "Overriding chunk_size with an overestimated value of "
@@ -328,9 +343,7 @@ class ExllamaV2Container(BaseModelContainer):
         if self.use_draft_model:
             self.draft_config.max_seq_len = self.config.max_seq_len
 
-            self.draft_config.scale_pos_emb = unwrap(
-                draft_args.get("draft_rope_scale"), 1.0
-            )
+            self.draft_config.scale_pos_emb = unwrap(draft_args.get("draft_rope_scale"), 1.0)
 
             # Set draft rope alpha. Follows same behavior as model rope alpha.
             # Use the max_position_embeddings of the model
@@ -347,10 +360,8 @@ class ExllamaV2Container(BaseModelContainer):
             self.draft_cache_mode = unwrap(draft_args.get("draft_cache_mode"), "FP16")
 
             # Catch exllamav3 draft_cache_mode
-            if self.draft_cache_mode != "FP16" and not self.draft_cache_mode.startswith(
-                "Q"
-            ):
-                logger.warning(
+            if self.draft_cache_mode != "FP16" and not self.draft_cache_mode.startswith("Q"):
+                xlogger.warning(
                     f"Provided draft cache mode '{self.draft_cache_mode}' is not a "
                     "valid choice for exllamav2, please check your settings. "
                     "Defaulting to FP16."
@@ -366,6 +377,8 @@ class ExllamaV2Container(BaseModelContainer):
         self.reasoning = kwargs.get("reasoning", False)
         self.reasoning_start_token = kwargs.get("reasoning_start_token", "<think>")
         self.reasoning_end_token = kwargs.get("reasoning_end_token", "</think>")
+        self.reasoning_suppress_header = kwargs.get("reasoning_suppress_header", None)
+        self.force_enable_thinking = kwargs.get("force_enable_thinking", False)
 
         # Return the created instance
         return self
@@ -377,7 +390,7 @@ class ExllamaV2Container(BaseModelContainer):
         if cache_remainder != 0:
             rounded_cache_size = int(256 * ((cache_size - cache_remainder) / 256 + 1))
 
-            logger.warning(
+            xlogger.warning(
                 f"The given cache size ({cache_size}) is "
                 "not a multiple of 256.\n"
                 "Overriding cache_size with an overestimated value of "
@@ -387,7 +400,7 @@ class ExllamaV2Container(BaseModelContainer):
             cache_size = rounded_cache_size
 
         if self.config.max_seq_len > cache_size:
-            logger.warning(
+            xlogger.warning(
                 f"The given max_seq_len ({self.config.max_seq_len}) is larger than "
                 f"the cache size and will be limited to {cache_size} tokens."
             )
@@ -395,7 +408,7 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Warn user if cache size may be inadequate for CFG
         if cache_size < 2 * self.config.max_seq_len:
-            logger.warning(
+            xlogger.warning(
                 f"The given cache_size ({cache_size}) is less than 2 * max_seq_len "
                 "and may be too small for requests using CFG. \n"
                 "Ignore this warning if you do not plan on using CFG."
@@ -410,12 +423,12 @@ class ExllamaV2Container(BaseModelContainer):
                 self.hf_model.hf_config.get_max_position_embeddings(), self.cache_size
             )
 
-            logger.warning(
+            xlogger.warning(
                 f"max_seq_len is undefined. Overriding to {default_max_seq_len} tokens."
             )
             max_seq_len = default_max_seq_len
         elif max_seq_len > self.cache_size:
-            logger.warning(
+            xlogger.warning(
                 f"The given max_seq_len ({max_seq_len}) is larger than the cache size "
                 f"and will be limited to {self.cache_size} tokens."
             )
@@ -469,9 +482,8 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Immediately abort all jobs if asked
         if skip_wait:
-            logger.warning(
-                "Immediately terminating all jobs. "
-                "Clients will have their requests cancelled.\n"
+            xlogger.warning(
+                "Immediately terminating all jobs. Clients will have their requests cancelled.\n"
             )
 
             for job in self.active_job_ids.values():
@@ -522,7 +534,7 @@ class ExllamaV2Container(BaseModelContainer):
 
             # Cleanup and update model load state
             self.loaded = True
-            logger.info("Model successfully loaded.")
+            xlogger.info("Model successfully loaded.")
         finally:
             self.load_lock.release()
 
@@ -554,20 +566,18 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Calculate autosplit reserve for all GPUs
         gpu_count = torch.cuda.device_count()
-        autosplit_reserve = self.autosplit_reserve + [0] * (
-            gpu_count - len(self.autosplit_reserve)
-        )
+        autosplit_reserve = self.autosplit_reserve + [0] * (gpu_count - len(self.autosplit_reserve))
 
         # Load draft model if a config is present
         if self.draft_config:
             self.draft_model = ExLlamaV2(self.draft_config)
-            logger.info("Loading draft model: " + self.draft_config.model_dir)
+            xlogger.info("Loading draft model: " + self.draft_config.model_dir)
 
             # Draft uses the autosplit loader, so create a cache that reflects this
             draft_cache_class = self.get_cache_class(self.draft_cache_mode)
 
             if self.draft_gpu_split:
-                logger.info("Loading with a manual GPU split (or a one GPU setup)")
+                xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
 
                 for value in self.draft_model.load_gen(
                     self.draft_gpu_split,
@@ -583,7 +593,7 @@ class ExllamaV2Container(BaseModelContainer):
                     model=self.draft_model,
                 )
             else:
-                logger.info("Loading with autosplit")
+                xlogger.info("Loading with autosplit")
 
                 self.draft_cache = self.create_cache(
                     cache_class=draft_cache_class,
@@ -614,7 +624,7 @@ class ExllamaV2Container(BaseModelContainer):
                     yield value
 
         self.model = ExLlamaV2(self.config)
-        logger.info("Loading model: " + self.config.model_dir)
+        xlogger.info("Loading model: " + self.config.model_dir)
 
         # Get class of the model cache
         cache_class = self.get_cache_class(self.cache_mode)
@@ -622,7 +632,7 @@ class ExllamaV2Container(BaseModelContainer):
         # Load model with manual split
         # Entrypoint for single GPU users
         if self.use_tp:
-            logger.info("Loading with tensor parallel")
+            xlogger.info("Loading with tensor parallel")
 
             # GPU split must be None if the array is empty
             # Otherwise the TP loader fails
@@ -635,7 +645,7 @@ class ExllamaV2Container(BaseModelContainer):
                 if value:
                     yield value
         elif not self.gpu_split_auto:
-            logger.info("Loading with a manual GPU split (or a one GPU setup)")
+            xlogger.info("Loading with a manual GPU split (or a one GPU setup)")
 
             for value in self.model.load_gen(
                 self.gpu_split,
@@ -654,7 +664,7 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Load model with autosplit (without TP)
         if self.gpu_split_auto and not self.use_tp:
-            logger.info("Loading with autosplit")
+            xlogger.info("Loading with autosplit")
 
             for value in self.model.load_autosplit_gen(
                 self.cache,
@@ -766,24 +776,24 @@ class ExllamaV2Container(BaseModelContainer):
                 lora_scaling = unwrap(lora.get("scaling"), 1.0)
 
                 if lora_name is None:
-                    logger.warning(
+                    xlogger.warning(
                         "One of your loras does not have a name. Please check your "
                         "config.yml! Skipping lora load."
                     )
                     failure.append(lora_name)
                     continue
 
-                logger.info(f"Adding lora: {lora_name} at scaling {lora_scaling}")
+                xlogger.info(f"Adding lora: {lora_name} at scaling {lora_scaling}")
                 lora_path = lora_directory / lora_name
 
                 loras_to_load.append(
                     ExLlamaV2Lora.from_directory(self.model, lora_path, lora_scaling)
                 )
-                logger.info(f"Lora successfully added: {lora_name}")
+                xlogger.info(f"Lora successfully added: {lora_name}")
                 success.append(lora_name)
 
             self.generator.generator.set_loras(loras_to_load)
-            logger.info("All loras successfully loaded")
+            xlogger.info("All loras successfully loaded")
 
             # Return success and failure names
             return {"success": success, "failure": failure}
@@ -849,7 +859,7 @@ class ExllamaV2Container(BaseModelContainer):
             gc.collect()
             torch.cuda.empty_cache()
 
-            logger.info("Loras unloaded." if loras_only else "Model unloaded.")
+            xlogger.info("Loras unloaded." if loras_only else "Model unloaded.")
         finally:
             if not do_shutdown:
                 self.load_lock.release()
@@ -866,9 +876,7 @@ class ExllamaV2Container(BaseModelContainer):
         return (
             self.tokenizer.encode(
                 text,
-                add_bos=unwrap(
-                    kwargs.get("add_bos_token"), self.hf_model.add_bos_token()
-                ),
+                add_bos=unwrap(kwargs.get("add_bos_token"), self.hf_model.add_bos_token()),
                 encode_special_tokens=unwrap(kwargs.get("encode_special_tokens"), True),
                 embeddings=mm_embeddings_content,
             )
@@ -904,9 +912,7 @@ class ExllamaV2Container(BaseModelContainer):
         top_values = torch.log(token_probs).flatten().tolist()
 
         # Cannot return -inf in JSON
-        cleaned_values = [
-            -1000 if value == float("-inf") else value for value in top_values
-        ]
+        cleaned_values = [-1000 if value == float("-inf") else value for value in top_values]
 
         return dict(zip_longest(top_tokens, cleaned_values))
 
@@ -915,7 +921,7 @@ class ExllamaV2Container(BaseModelContainer):
         request_id: str,
         prompt: str,
         params: BaseSamplerRequest,
-        abort_event: Optional[asyncio.Event] = None,
+        disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
     ):
         """Generate a response to a prompt."""
@@ -924,9 +930,11 @@ class ExllamaV2Container(BaseModelContainer):
             request_id,
             prompt,
             params,
-            abort_event,
+            disconnect_handler,
             mm_embeddings,
         ):
+            if generation is None:
+                continue
             generations.append(generation)
 
         joined_generation = {
@@ -953,18 +961,12 @@ class ExllamaV2Container(BaseModelContainer):
         if len(generations) > 0:
             for generation in generations:
                 joined_generation["offset"].append(unwrap(generation.get("offset"), -1))
-                joined_generation["token_probs"].update(
-                    unwrap(generation.get("token_probs"), {})
-                )
+                joined_generation["token_probs"].update(unwrap(generation.get("token_probs"), {}))
 
                 # Include empty logprob dicts for index preservation
-                joined_generation["logprobs"].append(
-                    unwrap(generation.get("logprobs"), {})
-                )
+                joined_generation["logprobs"].append(unwrap(generation.get("logprobs"), {}))
 
-            joined_generation["prompt_tokens"] = unwrap(
-                generations[-1].get("prompt_tokens"), 0
-            )
+            joined_generation["prompt_tokens"] = unwrap(generations[-1].get("prompt_tokens"), 0)
             joined_generation["generated_tokens"] = unwrap(
                 generations[-1].get("generated_tokens"), 0
             )
@@ -976,8 +978,9 @@ class ExllamaV2Container(BaseModelContainer):
         request_id: str,
         prompt: str,
         params: BaseSamplerRequest,
-        abort_event: Optional[asyncio.Event] = None,
+        disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
+        filter_trigger: str = None,
     ):
         try:
             # Wait for load lock to be freed before processing
@@ -999,7 +1002,7 @@ class ExllamaV2Container(BaseModelContainer):
                 request_id=request_id,
                 prompt=prompt,
                 params=params,
-                abort_event=abort_event,
+                disconnect_handler=disconnect_handler,
                 mm_embeddings=mm_embeddings,
             ):
                 yield generation_chunk
@@ -1058,12 +1061,8 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Warn if max/min temp values are > 0
         # and if they're less than or equal to each other
-        if max_temp < min_temp or (
-            1 not in {min_temp, max_temp} and max_temp == min_temp
-        ):
-            logger.warning(
-                "Max temp is less than or equal to min temp, skipping DynaTemp."
-            )
+        if max_temp < min_temp or (1 not in {min_temp, max_temp} and max_temp == min_temp):
+            xlogger.warning("Max temp is less than or equal to min temp, skipping DynaTemp.")
 
         # Default tau and eta fallbacks don't matter if mirostat is off
         gen_settings.mirostat_tau = params.mirostat_tau
@@ -1075,9 +1074,7 @@ class ExllamaV2Container(BaseModelContainer):
         gen_settings.token_presence_penalty = params.presence_penalty
 
         # Applies for all penalties despite being called token_repetition_range
-        gen_settings.token_repetition_range = unwrap(
-            params.penalty_range, self.config.max_seq_len
-        )
+        gen_settings.token_repetition_range = unwrap(params.penalty_range, self.config.max_seq_len)
 
         # Always make sure the fallback is 0 if range < 0
         # It's technically fine to use -1, but this just validates the passed
@@ -1087,9 +1084,7 @@ class ExllamaV2Container(BaseModelContainer):
             fallback_decay = 0
         else:
             fallback_decay = gen_settings.token_repetition_range
-        gen_settings.token_repetition_decay = coalesce(
-            params.repetition_decay, fallback_decay, 0
-        )
+        gen_settings.token_repetition_decay = coalesce(params.repetition_decay, fallback_decay, 0)
 
         # DRY options
         dry_multiplier = params.dry_multiplier
@@ -1112,21 +1107,15 @@ class ExllamaV2Container(BaseModelContainer):
 
         # Add JSON schema filter if it exists
         if params.json_schema:
-            grammar_handler.add_json_schema_filter(
-                params.json_schema, self.model, self.tokenizer
-            )
+            grammar_handler.add_json_schema_filter(params.json_schema, self.model, self.tokenizer)
 
         # Add regex filter if it exists
         if params.regex_pattern:
-            grammar_handler.add_regex_filter(
-                params.regex_pattern, self.model, self.tokenizer
-            )
+            grammar_handler.add_regex_filter(params.regex_pattern, self.model, self.tokenizer)
 
         # Add EBNF filter if it exists
         if params.grammar_string:
-            grammar_handler.add_kbnf_filter(
-                params.grammar_string, self.model, self.tokenizer
-            )
+            grammar_handler.add_kbnf_filter(params.grammar_string, self.model, self.tokenizer)
 
         # Speculative Ngram
         self.generator.speculative_ngram = params.speculative_ngram
@@ -1138,7 +1127,7 @@ class ExllamaV2Container(BaseModelContainer):
             gen_settings.top_p = 0
             gen_settings.typical = 0
 
-            logger.warning(
+            xlogger.warning(
                 "Temperature is set to 0. Overriding temp, "
                 "top_k, top_p, and typical to 1.0, 1, 0, and 0."
             )
@@ -1166,9 +1155,8 @@ class ExllamaV2Container(BaseModelContainer):
                 if 0 <= token_id < len(self.tokenizer.get_id_to_piece_list(True)):
                     gen_settings.token_bias[token_id] = bias
                 else:
-                    logger.warning(
-                        f"Logit bias: Token {token_id} not present "
-                        "in the model's vocab. Skipping."
+                    xlogger.warning(
+                        f"Logit bias: Token {token_id} not present in the model's vocab. Skipping."
                     )
 
     # Adds logprobs to a generation chunk
@@ -1249,7 +1237,7 @@ class ExllamaV2Container(BaseModelContainer):
         request_id: str,
         prompt: str,
         params: BaseSamplerRequest,
-        abort_event: Optional[asyncio.Event] = None,
+        disconnect_handler: DisconnectHandler = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
     ):
         """
@@ -1271,9 +1259,8 @@ class ExllamaV2Container(BaseModelContainer):
         # Set banned strings
         banned_strings = params.banned_strings
         if banned_strings and len(grammar_handler.filters) > 0:
-            logger.warning(
-                "Disabling banned_strings because "
-                "they cannot be used with grammar filters."
+            xlogger.warning(
+                "Disabling banned_strings because they cannot be used with grammar filters."
             )
 
             banned_strings = []
@@ -1286,13 +1273,11 @@ class ExllamaV2Container(BaseModelContainer):
                 gen_settings.cfg_scale = cfg_scale
 
                 # If the negative prompt is empty, use the BOS token
-                negative_prompt = unwrap(
-                    params.negative_prompt, self.tokenizer.bos_token
-                )
+                negative_prompt = unwrap(params.negative_prompt, self.tokenizer.bos_token)
 
                 prompts.append(negative_prompt)
             else:
-                logger.warning(
+                xlogger.warning(
                     "CFG is currently disabled because paged mode is disabled. "
                     "Please use an ampere (30 series) or higher GPU for CFG support."
                 )
@@ -1301,8 +1286,7 @@ class ExllamaV2Container(BaseModelContainer):
         # Only do this if freq/pres pen is enabled
         # and the repetition range is -1
         auto_scale_penalty_range = (
-            gen_settings.token_frequency_penalty != 0
-            or gen_settings.token_presence_penalty != 0
+            gen_settings.token_frequency_penalty != 0 or gen_settings.token_presence_penalty != 0
         ) and gen_settings.token_repetition_range == -1
 
         stop_conditions = params.stop
@@ -1345,18 +1329,14 @@ class ExllamaV2Container(BaseModelContainer):
         # Automatically set max_tokens to fill up the context
         max_tokens = unwrap(params.max_tokens, 0)
         if max_tokens <= 0:
-            max_tokens = self.config.max_seq_len - max(
-                context_len, negative_context_len
-            )
+            max_tokens = self.config.max_seq_len - max(context_len, negative_context_len)
 
         # Determine if the negative context or the context length is bigger
         context_to_check = max(negative_context_len, context_len)
 
         # Check total length of prompt against max context length
         if context_to_check > self.config.max_seq_len:
-            preamble = (
-                "Negative prompt" if negative_context_len > context_len else "Prompt"
-            )
+            preamble = "Negative prompt" if negative_context_len > context_len else "Prompt"
 
             raise ValueError(
                 f"{preamble} length {context_to_check} is greater than "
@@ -1404,6 +1384,7 @@ class ExllamaV2Container(BaseModelContainer):
             identifier=request_id,
             embeddings=mm_embeddings_content,
         )
+        await disconnect_handler.add_cleanup_task(id(job), job.cancel, ())
 
         # Assign the active job to the request ID
         self.active_job_ids[request_id] = job
@@ -1420,9 +1401,7 @@ class ExllamaV2Container(BaseModelContainer):
         try:
             async for result in job:
                 # Abort if the event is set while streaming
-                if abort_event and abort_event.is_set():
-                    await job.cancel()
-                    break
+                await disconnect_handler.poll()
 
                 stage = result.get("stage")
                 result_id = result.get("identifier")
@@ -1456,10 +1435,8 @@ class ExllamaV2Container(BaseModelContainer):
                     # Yield a finish chunk when generation is finished
                     if result.get("eos"):
                         log_response(request_id, full_response)
-
-                        finish_chunk = self.handle_finish_chunk(
-                            result, request_id, full_response
-                        )
+                        finish_chunk = self.handle_finish_chunk(result, request_id, full_response)
+                        await disconnect_handler.finish(id(job))
 
                         # Save the final result for metrics logging
                         metrics_result = finish_chunk
@@ -1467,14 +1444,17 @@ class ExllamaV2Container(BaseModelContainer):
                         yield finish_chunk
                         break
         except asyncio.CancelledError:
-            await job.cancel()
+            if not job.cancelled:
+                await job.cancel()
+
         except Exception as ex:
             # Create a new generator since the current state is broken
             # No need to wait for this to finish
-            logger.error(
+            xlogger.error(
                 "FATAL ERROR with generation. "
                 "Attempting to recreate the generator. "
-                "If this fails, please restart the server.\n"
+                "If this fails, please restart the server.\n",
+                {"exception": str(ex)},
             )
             asyncio.ensure_future(self.create_generator())
 

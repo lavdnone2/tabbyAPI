@@ -6,7 +6,7 @@ import pathlib
 from pydantic_core import ValidationError
 from ruamel.yaml import YAML
 from copy import deepcopy
-from loguru import logger
+from common.logger import xlogger
 from pydantic import (
     AliasChoices,
     BaseModel,
@@ -25,9 +25,7 @@ class BaseSamplerRequest(BaseModel):
 
     max_tokens: Optional[int] = Field(
         default_factory=lambda: get_default_sampler_value("max_tokens"),
-        validation_alias=AliasChoices(
-            "max_tokens", "max_completion_tokens", "max_length"
-        ),
+        validation_alias=AliasChoices("max_tokens", "max_completion_tokens", "max_length"),
         description="Aliases: max_length",
         examples=[150],
         ge=0,
@@ -97,13 +95,9 @@ class BaseSamplerRequest(BaseModel):
         examples=[1.0],
     )
 
-    top_a: Optional[float] = Field(
-        default_factory=lambda: get_default_sampler_value("top_a", 0.0)
-    )
+    top_a: Optional[float] = Field(default_factory=lambda: get_default_sampler_value("top_a", 0.0))
 
-    min_p: Optional[float] = Field(
-        default_factory=lambda: get_default_sampler_value("min_p", 0.0)
-    )
+    min_p: Optional[float] = Field(default_factory=lambda: get_default_sampler_value("min_p", 0.0))
 
     tfs: Optional[float] = Field(
         default_factory=lambda: get_default_sampler_value("tfs", 1.0),
@@ -158,9 +152,7 @@ class BaseSamplerRequest(BaseModel):
             "repetition_penalty_range",
             "rep_pen_range",
         ),
-        description=(
-            "Aliases: repetition_range, repetition_penalty_range, rep_pen_range"
-        ),
+        description=("Aliases: repetition_range, repetition_penalty_range, rep_pen_range"),
     )
 
     repetition_decay: Optional[int] = Field(
@@ -275,6 +267,12 @@ class BaseSamplerRequest(BaseModel):
         ge=0,
     )
 
+    # Valid for OAI requests
+    top_logprobs: Optional[int] = Field(
+        default_factory=lambda: get_default_sampler_value("top_logprobs", 0),
+        ge=0,
+    )
+
     adaptive_target: Optional[float] = Field(
         default_factory=lambda: get_default_sampler_value("adaptive_target", 1.0)
     )
@@ -288,7 +286,7 @@ class BaseSamplerRequest(BaseModel):
         """Fixes instance if Top-K is -1."""
 
         if v == -1:
-            logger.warning("Provided a top-k value of -1. Converting to 0 instead.")
+            xlogger.warning("Provided a top-k value of -1. Converting to 0 instead.")
             return 0
 
         return v
@@ -321,13 +319,15 @@ class BaseSamplerRequest(BaseModel):
         try:
             return json.loads(v) if isinstance(v, str) else v
         except Exception:
-            logger.warning(
-                "Could not parse DRY sequence breakers. Using an empty array."
-            )
+            xlogger.warning("Could not parse DRY sequence breakers. Using an empty array.")
             return []  # Return empty list if parsing fails
 
     @model_validator(mode="after")
     def after_validate(self):
+        # For OAI requests, logprobs is a boolean and top_logprobs is integer
+        # if self.logprobs and self.top_logprobs:
+        #     self.logprobs = self.top_logprobs
+
         # FIXME: find a better way to register this
         # Maybe make a function to assign values to the
         # model if they do not exist post creation
@@ -374,7 +374,7 @@ async def overrides_from_file(preset_name: str):
             preset = yaml.load(contents)
             overrides_from_dict(preset)
 
-            logger.info("Applied sampler overrides from file.")
+            xlogger.info("Applied sampler overrides from file.", {"preset": preset})
     else:
         error_message = (
             f'Sampler override file named "{preset_name}" was not found. '
@@ -408,6 +408,10 @@ def get_default_sampler_value(key, fallback=None):
 
 def apply_forced_sampler_overrides(params: BaseSamplerRequest):
     """Forcefully applies overrides if specified by the user"""
+
+    # Tolerate older OAI standard for logprobs
+    if isinstance(params.logprobs, int) and params.logprobs > 1:
+        params.top_logprobs = params.logprobs
 
     for var, value in overrides_container.overrides.items():
         override = deepcopy(value.get("override"))

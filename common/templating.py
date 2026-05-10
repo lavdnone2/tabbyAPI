@@ -4,14 +4,14 @@ import traceback
 import aiofiles
 import json
 import pathlib
-from dataclasses import dataclass, field
 from datetime import datetime
 from importlib.metadata import version as package_version
-from typing import List, Optional
+from typing import Optional
 from jinja2 import Template, TemplateError
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
-from loguru import logger
+from common.logger import xlogger
+from markupsafe import Markup
 from packaging import version
 
 
@@ -24,12 +24,7 @@ class TemplateLoadError(Exception):
     pass
 
 
-@dataclass
-class TemplateMetadata:
-    """Represents the parsed metadata from a template."""
-
-    stop_strings: List[str] = field(default_factory=list)
-    tool_start: Optional[str] = None
+VALID_TOOL_CALL_FORMATS = {"json", "xml", "auto"}
 
 
 class PromptTemplate:
@@ -44,40 +39,22 @@ class PromptTemplate:
         enable_async=True,
         extensions=[loopcontrols],
     )
-    metadata: Optional[TemplateMetadata] = None
 
-    async def extract_metadata(self, template_vars: dict):
+    @staticmethod
+    def _tojson_compat(value, indent=None, ensure_ascii=True):
+        """Compatibility JSON filter for chat templates.
+
+        Some model templates call ``tojson(ensure_ascii=False)`` while the
+        bundled Jinja filter may not accept that keyword in sandboxed mode.
         """
-        Returns deserialized template metadata from a chat template.
-
-        NOTE: Requires all template vars to be passed in since the template
-        is run once to make a module and errors can result.
-        """
-
-        # No need to extract new metadata if it already exists
-        # This might be removed if stored metadata becomes arbitrary
-        if self.metadata:
-            return self.metadata
-
-        template_metadata = TemplateMetadata()
-
-        template_module = await self.template.make_module_async(template_vars)
-
-        if hasattr(template_module, "stop_strings"):
-            if isinstance(template_module.stop_strings, list):
-                template_metadata.stop_strings += template_module.stop_strings
-            else:
-                logger.warning(
-                    "Skipping append of stopping strings from chat template "
-                    "because stop_strings isn't a list."
-                )
-
-        if hasattr(template_module, "tool_start"):
-            if isinstance(template_module.tool_start, str):
-                template_metadata.tool_start = template_module.tool_start
-
-        self.metadata = template_metadata
-        return template_metadata
+        return Markup(
+            json.dumps(
+                value,
+                indent=indent,
+                ensure_ascii=ensure_ascii,
+                separators=(",", ": "),
+            )
+        )
 
     async def render(self, template_vars: dict):
         """Get a prompt from a template and a list of messages."""
@@ -107,6 +84,7 @@ class PromptTemplate:
 
         self.environment.globals["strftime_now"] = strftime_now
         self.environment.globals["raise_exception"] = raise_exception
+        self.environment.filters["tojson"] = self._tojson_compat
 
         return self.environment.from_string(template_str)
 
@@ -129,9 +107,7 @@ class PromptTemplate:
             template_path = template_path.with_suffix(".jinja")
 
         if template_path.exists():
-            async with aiofiles.open(
-                template_path, "r", encoding="utf8"
-            ) as raw_template_stream:
+            async with aiofiles.open(template_path, "r", encoding="utf8") as raw_template_stream:
                 contents = await raw_template_stream.read()
                 return cls(
                     name=template_name,
@@ -139,14 +115,10 @@ class PromptTemplate:
                 )
         else:
             # Let the user know if the template file isn't found
-            raise TemplateLoadError(
-                f'Chat template "{template_name}" not found in files.'
-            )
+            raise TemplateLoadError(f'Chat template "{template_name}" not found in files.')
 
     @classmethod
-    async def from_model_json(
-        cls, json_path: pathlib.Path, key: str, name: Optional[str] = None
-    ):
+    async def from_model_json(cls, json_path: pathlib.Path, key: str, name: Optional[str] = None):
         """Get a template from a JSON file. Requires a key and template name"""
         if not json_path.exists():
             raise TemplateLoadError(f'Model JSON path "{json_path}" not found.')
@@ -179,8 +151,7 @@ class PromptTemplate:
                     return PromptTemplate(name=name, raw_template=selected_template)
                 else:
                     raise TemplateLoadError(
-                        f'Chat template with name "{name}" not found '
-                        "in model templates list."
+                        f'Chat template with name "{name}" not found in model templates list.'
                     )
             else:
                 # Can safely assume the chat template is the old style
@@ -215,7 +186,7 @@ def find_template_from_model(model_path: pathlib.Path):
 async def find_prompt_template(template_name, model_dir: pathlib.Path):
     """Tries to find a prompt template using various methods."""
 
-    logger.info("Attempting to load a prompt template if present.")
+    xlogger.info("Attempting to load a prompt template if present.")
 
     find_template_functions = [
         lambda: PromptTemplate.from_file(model_dir / "chat_template.jinja"),
@@ -233,9 +204,7 @@ async def find_prompt_template(template_name, model_dir: pathlib.Path):
     # Find the template in the model directory if it exists
     model_dir_template_path = model_dir / "tabby_template.jinja"
     if model_dir_template_path.exists():
-        find_template_functions[:0] = [
-            lambda: PromptTemplate.from_file(model_dir_template_path)
-        ]
+        find_template_functions[:0] = [lambda: PromptTemplate.from_file(model_dir_template_path)]
 
     # Add lookup from prompt template name if provided
     # TODO: Possibly link to the TokenizerConfig class
@@ -256,12 +225,14 @@ async def find_prompt_template(template_name, model_dir: pathlib.Path):
             if prompt_template is not None:
                 return prompt_template
         except TemplateLoadError as e:
-            logger.warning(f"TemplateLoadError: {str(e)}")
+            xlogger.warning("TemplateLoadError", {"exception": str(e)}, details=f"{str(e)}")
             continue
         except Exception:
-            logger.error(traceback.format_exc())
-            logger.warning(
+            xlogger.error(traceback.format_exc())
+            xlogger.warning(
                 "An unexpected error happened when trying to load the template. "
                 "Trying other methods."
             )
             continue
+
+    return None

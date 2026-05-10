@@ -10,6 +10,7 @@ from ruamel.yaml import YAML
 from fastapi import Header, HTTPException, Request
 from pydantic import BaseModel
 from loguru import logger
+from common.logger import xlogger
 from typing import Optional
 
 from common.utils import coalesce
@@ -50,7 +51,7 @@ async def load_auth_keys(disable_from_config: bool):
 
     DISABLE_AUTH = disable_from_config
     if disable_from_config:
-        logger.warning(
+        xlogger.warning(
             "Disabling authentication makes your instance vulnerable. "
             "Set the `disable_auth` flag to False in config.yml if you "
             "want to share this instance with others."
@@ -67,9 +68,7 @@ async def load_auth_keys(disable_from_config: bool):
             auth_keys_dict = yaml.load(contents)
             AUTH_KEYS = AuthKeys.model_validate(auth_keys_dict)
     except FileNotFoundError:
-        new_auth_keys = AuthKeys(
-            api_key=secrets.token_hex(16), admin_key=secrets.token_hex(16)
-        )
+        new_auth_keys = AuthKeys(api_key=secrets.token_hex(16), admin_key=secrets.token_hex(16))
         AUTH_KEYS = new_auth_keys
 
         async with aiofiles.open("api_tokens.yml", "w", encoding="utf8") as auth_file:
@@ -80,7 +79,7 @@ async def load_auth_keys(disable_from_config: bool):
 
     logger.info(
         f"Your API key is: {AUTH_KEYS.api_key}\n"
-        f"Your admin key is: {AUTH_KEYS.admin_key}\n\n"
+        f"Your admin key is: {AUTH_KEYS.admin_key}\n"
         "If these keys get compromised, make sure to delete api_tokens.yml "
         "and restart the server. Have fun!"
     )
@@ -118,9 +117,7 @@ def get_key_permission(request: Request):
         raise ValueError("The provided authentication key is invalid.")
 
 
-async def check_api_key(
-    x_api_key: str = Header(None), authorization: str = Header(None)
-):
+async def check_api_key(x_api_key: str = Header(None), authorization: str = Header(None)):
     """Check if the API key is valid."""
 
     # Allow request if auth is disabled
@@ -136,9 +133,7 @@ async def check_api_key(
         split_key = authorization.split(" ")
         if len(split_key) < 2:
             raise HTTPException(401, "Invalid API key")
-        if split_key[0].lower() != "bearer" or not AUTH_KEYS.verify_key(
-            split_key[1], "api_key"
-        ):
+        if split_key[0].lower() != "bearer" or not AUTH_KEYS.verify_key(split_key[1], "api_key"):
             raise HTTPException(401, "Invalid API key")
 
         return authorization
@@ -146,9 +141,7 @@ async def check_api_key(
     raise HTTPException(401, "Please provide an API key")
 
 
-async def check_admin_key(
-    x_admin_key: str = Header(None), authorization: str = Header(None)
-):
+async def check_admin_key(x_admin_key: str = Header(None), authorization: str = Header(None)):
     """Check if the admin key is valid."""
 
     # Allow request if auth is disabled
@@ -164,9 +157,7 @@ async def check_admin_key(
         split_key = authorization.split(" ")
         if len(split_key) < 2:
             raise HTTPException(401, "Invalid admin key")
-        if split_key[0].lower() != "bearer" or not AUTH_KEYS.verify_key(
-            split_key[1], "admin_key"
-        ):
+        if split_key[0].lower() != "bearer" or not AUTH_KEYS.verify_key(split_key[1], "admin_key"):
             raise HTTPException(401, "Invalid admin key")
         return authorization
 

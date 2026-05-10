@@ -22,6 +22,7 @@ class BaseModelContainer(abc.ABC):
     # Exposed model information
     model_dir: pathlib.Path = pathlib.Path("models")
     prompt_template: Optional[PromptTemplate] = None
+    tool_format: Optional[str] = None
 
     # HF Model instance
     hf_model: HFModel
@@ -42,6 +43,8 @@ class BaseModelContainer(abc.ABC):
     reasoning: bool
     reasoning_start_token: Optional[str]
     reasoning_end_token: Optional[str]
+    reasoning_suppress_header: Optional[str]
+    force_enable_thinking: Optional[str]
 
     # Required methods
     @classmethod
@@ -167,9 +170,7 @@ class BaseModelContainer(abc.ABC):
         pass
 
     # Optional methods
-    async def load_loras(
-        self, lora_directory: pathlib.Path, **kwargs
-    ) -> Dict[str, List[str]]:
+    async def load_loras(self, lora_directory: pathlib.Path, **kwargs) -> Dict[str, List[str]]:
         """
         Loads LoRA adapters. Base implementation does nothing or raises error.
 
@@ -184,9 +185,7 @@ class BaseModelContainer(abc.ABC):
         logger.warning("LoRA loading not implemented for this backend.")  # type: ignore
         return {
             "success": [],
-            "failure": [
-                lora.get("name", "unknown") for lora in kwargs.get("loras", [])
-            ],
+            "failure": [lora.get("name", "unknown") for lora in kwargs.get("loras", [])],
         }
 
     def get_loras(self) -> List[Any]:
@@ -232,6 +231,7 @@ class BaseModelContainer(abc.ABC):
         params: BaseSamplerRequest,
         abort_event: Optional[asyncio.Event] = None,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
+        filter_trigger: str = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a response iteratively (streaming) for a given prompt.
@@ -242,6 +242,8 @@ class BaseModelContainer(abc.ABC):
             params: Sampling and generation parameters.
             abort_event: An asyncio Event to signal cancellation.
             mm_embeddings: Optional multimodal embeddings.
+            filter_trigger: Delay filters (from params) until trigger text.
+                Must map to single token.
 
         Yields:
             Generation chunks
