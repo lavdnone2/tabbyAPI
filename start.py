@@ -44,7 +44,7 @@ def get_user_choice(question: str, options_dict: dict):
 def get_install_features(lib_name: str = None):
     """Fetches the appropriate requirements file depending on the GPU"""
     install_features = None
-    possible_features = ["cu12", "amd"]
+    possible_features = ["cu12", "cu13", "amd"]
 
     if not lib_name:
         has_nvidia = which("nvidia-smi") is not None
@@ -61,7 +61,8 @@ def get_install_features(lib_name: str = None):
         else:
             gpu_lib_choices = {
                 "A": {"pretty": "NVIDIA Cuda 12.x", "internal": "cu12"},
-                "B": {"pretty": "AMD", "internal": "amd"},
+                "B": {"pretty": "NVIDIA Cuda 13.x", "internal": "cu13"},
+                "C": {"pretty": "AMD", "internal": "amd"},
             }
             print(
                 "WARNING: Auto-detection failed. "
@@ -152,7 +153,7 @@ def add_start_args(parser: argparse.ArgumentParser):
     start_group.add_argument(
         "--gpu-lib",
         type=str,
-        help="Select GPU library. Options: cu121, cu118, amd",
+        help="Select GPU library. Options: cu12, cu13, amd",
     )
 
 
@@ -173,7 +174,7 @@ def run_pip(command: List[str]):
     if has_uv:
         command.insert(0, "uv")
 
-    subprocess.run(command)
+    subprocess.run(command, check=True)
 
 
 if __name__ == "__main__":
@@ -198,8 +199,11 @@ if __name__ == "__main__":
     add_start_args(parser)
     args, _ = parser.parse_known_args()
 
-    # Log pip version
-    run_pip(["pip", "-V"])
+    # Log pip/uv version
+    if has_uv:
+        subprocess.run(["uv", "-V"])
+    else:
+        subprocess.run(["pip", "-V"])
 
     script_ext = "bat" if platform.system() == "Windows" else "sh"
     do_start_options_write = False
@@ -248,8 +252,13 @@ if __name__ == "__main__":
 
         # pip install .[features]
         print(f"Running install command: {' '.join(install_command)}")
-        run_pip(install_command)
-        print()
+
+        try:
+            run_pip(install_command)
+            print()
+        except subprocess.CalledProcessError:
+            print("\nDependency installation failed. Please check the logs and run again.\n")
+            sys.exit(1)
 
         if first_run:
             start_options["first_run_done"] = True
